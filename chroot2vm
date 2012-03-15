@@ -1,0 +1,106 @@
+#!/bin/bash
+
+VZROOT="$1"
+NAME="$2"
+SIZE="$3"
+ROOTPWD="$4"
+TMPDIR="${5:-/tmp}"
+
+
+[[ -z "$4" ]] && echo "Usage: $0 <vzroot> <name> <size> <root_password> [tmpdir]" && exit 0
+
+
+make_img() {
+   local name="$1" size="$2"
+   dd if=/dev/zero of="$name.img" bs=516096c count="$size" >/dev/null
+}
+
+make_parts() {
+   local name="$1" size="$2"
+   cat <<EOF | fdisk -u -C"$size" "$name.img" 1>/dev/null
+o
+n
+p
+1
+2048
+
+w
+EOF
+}
+
+get_free_loop() {
+   local count=0
+   while [ -b "/dev/loop$count" ]; do
+      if ! losetup "/dev/loop$count" >/dev/null 2>/dev/null; then
+         # Device is not used
+         echo "/dev/loop$count"
+         return 0
+      fi
+      let count=($count+1)
+   done
+   return 1
+}
+
+format_parts() {
+   local name="$1" size="$2" loopdev="$3"
+   local offset
+   let offset=($size*512)
+   losetup -o"$offset" "$loopdev" "$name.img"
+   mke2fs -b1024 "$loopdev" >/dev/null
+   tune2fs -j "$loopdev" >/dev/null
+}
+
+copy_data() {
+   local vzroot="$1" name="$2" loopdev="$3"
+   [[ -e "$name" ]] && echo "E: File $name exists. Remove it first" && exit 1
+   mkdir -p "$TMPDIR/$name"
+   mount "$loopdev" "$TMPDIR/$name"
+   # TODO: make excludes a parameter
+   rsync -a --numeric-ids --exclude "sig" "$VZROOT/" "$TMPDIR/$name"
+}
+
+adjust_params() {
+   local name="$1" uuid="$2" loopdev="$3"
+   # TODO: Find a way to guess linux-image-foobar
+   local kernel=linux-image-foobar grub=grub-pc
+   chroot "$TMPDIR/$name" apt-get install $kernel $grub
+   chroot "$TMPDIR/$name" chpasswd <<<"root:$ROOTPWD"
+   cat <<EOF >> "$TMPDIR/$name/etc/inittab"
+1:2345:respawn:/sbin/getty 38400 tty1
+2:23:respawn:/sbin/getty 38400 tty2
+3:23:respawn:/sbin/getty 38400 tty3
+4:23:respawn:/sbin/getty 38400 tty4
+5:23:respawn:/sbin/getty 38400 tty5
+6:23:respawn:/sbin/getty 38400 tty6
+EOF
+
+   cat <<EOF > "$TMPDIR/$name/etc/fstab"
+proc /proc proc nodev,noexec,nosuid 0 0
+UUID=$uuid / ext4 errors=remount-ro 0 1
+EOF
+
+   umount "$TMPDIR/$name"
+   losetup -d "$loopdev"
+}
+
+
+
+make_img "$NAME" "$SIZE"
+make_parts "$NAME" "$SIZE"
+
+LOOPDEV=$(get_free_loop)
+[[ $? != 0 ]] && echo "E: Could not find a free loop device" >&2 && exit 1
+
+echo "I: LOOPDEV=$LOOPDEV"
+
+format_parts "$NAME" "$SIZE" "$LOOPDEV"
+
+UUID=$(blkid "$LOOPDEV" | sed -e 's/.* UUID="\([^ ]\+\)" .*/\1/')
+[[ -z "$UUID" ]] && echo "E: No uuid found for partition" >&2 && exit 1
+
+echo "I: UUID=$UUID"
+
+copy_data "$VZROOT" "$NAME" "$LOOPDEV"
+
+adjust_params "$NAME" "$UUID" "$LOOPDEV"
+
